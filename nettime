@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# nettime — like time(1), but for network traffic.
+#   usage: sudo nettime [-i SECONDS] [-o SAMPLES.CSV] [-u USER] COMMAND [ARGS...]
+#
+# Runs COMMAND (children included) under a per-run kernel byte counter and
+# prints total bytes + peak Mbps on exit. The counting mechanism is picked at
+# runtime:
+#   * systemd hosts:  transient scope with IPAccounting=yes (BPF program on the
+#                     scope's cgroup), sampled via `systemctl show`; the final
+#                     totals are recovered from the journal after exit.
+#   * other hosts:    own cgroup2 leaf; egress counted by an
+#                     `iptables -m cgroup --path` rule on OUTPUT, ingress by
+#                     marking the cgroup's connections (CONNMARK in
+#                     mangle/OUTPUT) and counting INPUT bytes by that connmark.
+#                     Needs cgroup2 mounted at the kernel root plus xt_cgroup,
+#                     and conntrack+xt_connmark for ingress (kernel >= 4.5).
+#                     Counters outlive the process, so the final read is exact.
+# Override autodetection with NETTIME_MECH=systemd|iptables.
+#
+# Accuracy notes: both mechanisms count IP-layer bytes (headers + ACKs +
+# retransmits), so expect totals a few % above application payload — verified
+# +0.2% over payload on loopback, +4% on a 1500-MTU TLS path. Uncounted: the
+# first inbound packet of connections the command accepts as a server (~60 B
+# per connection), and inbound traffic of connections it never sends on.
+set -uo pipefail
+
+INTERVAL=1; CSV=""; RUN_AS="${SUDO_USER:-}"
+while getopts "i:o:u:h" opt; do
+  case "$opt" in
+    i) INTERVAL="$OPTARG" ;;
+    o) CSV="$OPTARG" ;;
+    u) RUN_AS="$OPTARG" ;;
+    *) echo "usage: sudo nettime [-i seconds] [-o samples.csv] [-u user] COMMAND [ARGS...]" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+awk -v i="$INTERVAL" 'BEGIN{exit !(i+0 > 0)}' \
+  || { echo "nettime: -i must be a positive number of seconds" >&2; exit 2; }
+[[ $# -gt 0 ]] || { echo "nettime: no command given" >&2; exit 2; }
+[[ $EUID -eq 0 ]] || { echo "nettime: must be root (per-cgroup accounting)" >&2; exit 1; }
+
+# Run the measured command as a normal user: -u USER wins; otherwise fall back
+# to the invoking sudo user. NETTIME_AS_ROOT=1 keeps it as root.
+[[ -n "$RUN_AS" && "${NETTIME_AS_ROOT:-0}" != 1 ]] && set -- runuser -u "$RUN_AS" -- "$@"
+
+MECH="${NETTIME_MECH:-auto}"
+if [[ "$MECH" == auto ]]; then
+  if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+    MECH=systemd
+  else
+    MECH=iptables
+  fi
+fi
+
+UNIT="nettime-$$"
+rx=0; tx=0
+
+case "$MECH" in
+systemd)
+  SCOPE="$UNIT.scope"
+  sample() {
+    local out i e
+    out=$(systemctl show "$SCOPE" -p IPIngressBytes -p IPEgressBytes 2>/dev/null) || return 1
+    i=$(sed -n 's/^IPIngressBytes=//p' <<<"$out")
+    e=$(sed -n 's/^IPEgressBytes=//p' <<<"$out")
+    [[ "$i" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || return 1
+    [[ "$i" == 18446744073709551615 || "$e" == 18446744073709551615 ]] && return 1
+    rx=$i; tx=$e
+  }
+  launch() {
+    # trap reset: bash starts &-children with SIGINT/SIGQUIT ignored; undo it
+    # so Ctrl-C reaches the measured command like it would under time(1).
+    # <&0 keeps the real stdin: & would otherwise reattach it to /dev/null
+    ( trap - INT QUIT
+      exec systemd-run --quiet --collect --scope --unit="$UNIT" -p IPAccounting=yes -- "$@" ) <&0 &
+    CHILD=$!
+  }
+  # With --collect the scope is gone once the command exits, but systemd logs
+  # its final totals ("... received 1.2M IP traffic, sent 340.5K IP traffic").
+  # Humanized, so lower precision than a live sample — use whichever is larger.
+  final_sample() {
+    local line i e
+    line=$(journalctl -q -u "$SCOPE" -o cat --since "@${START%.*}" 2>/dev/null \
+           | grep -m1 'IP traffic') || return 0
+    i=$(sed -n 's/.*received \([0-9.]\+[BKMGT]\?\) IP traffic.*/\1/p' <<<"$line")
+    e=$(sed -n 's/.*sent \([0-9.]\+[BKMGT]\?\) IP traffic.*/\1/p' <<<"$line")
+    [[ -n "$i" && -n "$e" ]] || return 0
+    read -r rx tx < <(awk -v i="$i" -v e="$e" -v rx="$rx" -v tx="$tx" '
+      function debyte(s,  u,f) {
+        u=substr(s,length(s),1); f=1
+        if (u=="K") f=1024; else if (u=="M") f=1048576
+        else if (u=="G") f=1073741824; else if (u=="T") f=1099511627776
+        if (f>1 || u=="B") s=substr(s,1,length(s)-1)
+        return (s+0)*f }
+      BEGIN{ i=debyte(i); e=debyte(e); printf "%d %d", (i>rx?i:rx), (e>tx?e:tx) }')
+  }
+  cleanup() { :; }
+  ;;
+iptables)
+  # Egress: count filter/OUTPUT packets whose socket is in our cgroup.
+  # Ingress: `-m cgroup` only works where the kernel already knows the
+  # receiving socket at the INPUT hook (early demux) — that never happens on
+  # loopback, so instead we stamp a per-run conntrack mark on every connection
+  # our cgroup sends on (mangle/OUTPUT, where the cgroup IS known) and count
+  # filter/INPUT bytes by that connmark. Covers loopback, SYN-ACKs and DNS
+  # replies. Note: this overwrites any pre-existing conntrack mark on the
+  # measured app's connections — if this host uses connmark-based routing/QoS,
+  # set NETTIME_NO_CONNMARK=1 to fall back to plain cgroup matching (then
+  # loopback rx goes uncounted).
+  command -v iptables >/dev/null 2>&1 \
+    || { echo "nettime: no systemd and no iptables — cannot account" >&2; exit 1; }
+  CG2ROOT=$(awk '$3=="cgroup2"{print $2; exit}' /proc/self/mounts)
+  [[ -n "$CG2ROOT" ]] \
+    || { echo "nettime: no cgroup2 mount (mount -t cgroup2 cgroup2 /sys/fs/cgroup)" >&2; exit 1; }
+  CGDIR="$CG2ROOT/$UNIT"
+  IPTS=(iptables)
+  command -v ip6tables >/dev/null 2>&1 && IPTS+=(ip6tables)
+  MARK=$(printf '0x%08x' $(( 0x4E540000 | ($$ & 0xffff) )))  # "NT" tag + pid
+
+  ADDED=()  # "binary table chain rule-spec..." for exact removal
+  add_rule() {
+    local bin=$1 tbl=$2 chain=$3; shift 3
+    "$bin" -w -t "$tbl" -I "$chain" "$@" 2>/dev/null && ADDED+=("$bin $tbl $chain $*")
+  }
+  cleanup() {
+    local r i
+    for r in ${ADDED[@]+"${ADDED[@]}"}; do
+      # word splitting is intentional: rule specs contain no spaces-in-words
+      # shellcheck disable=SC2086
+      set -- $r; "$1" -w -t "$2" -D "$3" "${@:4}" 2>/dev/null
+    done
+    ADDED=()
+    [[ -d "$CGDIR" ]] || return 0
+    for i in {1..10}; do rmdir "$CGDIR" 2>/dev/null && return 0; sleep 0.2; done
+    echo "nettime: warning: could not remove $CGDIR (processes still inside?)" >&2
+  }
+  trap cleanup EXIT
+
+  mkdir "$CGDIR" || { echo "nettime: cannot create cgroup $CGDIR" >&2; exit 1; }
+  modprobe xt_cgroup 2>/dev/null; modprobe xt_connmark 2>/dev/null  # best-effort
+  setup_family() {  # $1 = iptables|ip6tables; rules for one address family
+    add_rule "$1" filter OUTPUT -m cgroup --path "$UNIT" || return 1
+    if [[ "${NETTIME_NO_CONNMARK:-0}" != 1 ]] \
+       && add_rule "$1" mangle OUTPUT -m cgroup --path "$UNIT" -j CONNMARK --set-mark "$MARK" \
+       && add_rule "$1" filter INPUT -m connmark --mark "$MARK"; then
+      :
+    else
+      [[ "${NETTIME_NO_CONNMARK:-0}" != 1 ]] \
+        && echo "nettime: warning: connmark unavailable — loopback rx will not be counted" >&2
+      add_rule "$1" filter INPUT -m cgroup --path "$UNIT" || return 1
+    fi
+  }
+  setup_family iptables || {
+    echo "nettime: iptables cannot match cgroup paths (xt_cgroup missing, or cgroup2 mount is not the kernel root)" >&2
+    exit 1
+  }
+  if [[ " ${IPTS[*]} " == *" ip6tables "* ]] && ! setup_family ip6tables; then
+    echo "nettime: warning: ip6tables rules failed — IPv6 traffic will not be counted" >&2
+    IPTS=(iptables)
+  fi
+
+  count_chain() {  # $1 = chain; summed byte counters of our rules, v4+v6
+    local t out sum=0 b
+    for t in "${IPTS[@]}"; do
+      out=$("$t"-save -c -t filter 2>/dev/null) || return 1
+      b=$(awk -v ch="$1" -v u="$UNIT" -v m="$MARK" '
+            $2 == "-A" && $3 == ch \
+              && ($0 ~ ("--path \"?" u "\"?( |$)") || $0 ~ ("--mark " m "( |/|$)")) {
+              split(substr($1, 2, length($1)-2), c, ":"); s += c[2]
+            } END { printf "%d", s+0 }' <<<"$out")
+      sum=$((sum + b))
+    done
+    echo "$sum"
+  }
+  sample() {
+    local i e
+    i=$(count_chain INPUT)  || return 1
+    e=$(count_chain OUTPUT) || return 1
+    rx=$i; tx=$e
+  }
+  final_sample() { sample; }  # counters outlive the process — exact
+  launch() {
+    # trap reset: see the systemd launch() note — Ctrl-C must reach the command
+    # <&0 keeps the real stdin: & would otherwise reattach it to /dev/null
+    ( trap - INT QUIT
+      echo "$BASHPID" > "$CGDIR/cgroup.procs" \
+        || { echo "nettime: failed to join cgroup $CGDIR" >&2; exit 125; }
+      exec "$@" ) <&0 &
+    CHILD=$!
+  }
+  ;;
+*)
+  echo "nettime: unknown NETTIME_MECH '$MECH' (want systemd or iptables)" >&2; exit 2 ;;
+esac
+
+trap 'INTERRUPTED=1' INT
+launch "$@"
+trap 'kill -TERM "$CHILD" 2>/dev/null' TERM
+
+START=$(date +%s.%N); prx=0; ptx=0; pt=0; peak=0; peak_at=0
+[[ -n "$CSV" ]] && echo "elapsed_s,rx_bytes,tx_bytes" > "$CSV"
+
+peak_update() {  # $1 = elapsed now; $2 = min window length to accept
+  read -r peak peak_at < <(awk -v rx="$rx" -v tx="$tx" -v prx="$prx" -v ptx="$ptx" \
+      -v pt="$pt" -v el="$1" -v mindt="$2" -v p="$peak" -v pa="$peak_at" \
+      'BEGIN{ dt=el-pt
+              if (dt>0 && dt>=mindt) { m=((rx-prx)+(tx-ptx))*8/dt/1e6; if (m>p) {p=m; pa=el} }
+              printf "%.4f %s", p, pa }')
+}
+
+# Pause for one interval, but wake immediately if the command exits (so short
+# commands report accurate wall time). Needs wait -n with pid args (bash 5.1+);
+# older bash just sleeps the full interval.
+pause() {
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    local sleeper
+    sleep "$INTERVAL" & sleeper=$!
+    wait -n "$CHILD" "$sleeper" 2>/dev/null
+    kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null
+  else
+    sleep "$INTERVAL"
+  fi
+}
+
+while kill -0 "$CHILD" 2>/dev/null; do
+  pause
+  kill -0 "$CHILD" 2>/dev/null || break  # exited: totals come from final_sample
+  sample || continue
+  el=$(awk -v a="$(date +%s.%N)" -v b="$START" 'BEGIN{printf "%.3f", a-b}')
+  [[ -n "$CSV" ]] && echo "$el,$rx,$tx" >> "$CSV"
+  peak_update "$el" 0
+  prx=$rx; ptx=$tx; pt=$el
+done
+wait "$CHILD"; STATUS=$?
+final_sample
+
+TOTAL_EL=$(awk -v a="$(date +%s.%N)" -v b="$START" 'BEGIN{printf "%.3f", a-b}')
+# The last window (final poll → exit) still counts toward peak, but a very
+# short tail would turn a few stray KB into a bogus rate spike — require at
+# least half an interval unless no poll ever completed.
+if [[ "$pt" == 0 ]]; then peak_update "$TOTAL_EL" 0
+else peak_update "$TOTAL_EL" "$(awk -v i="$INTERVAL" 'BEGIN{print i/2}')"
+fi
+if [[ -n "$CSV" ]]; then
+  echo "$TOTAL_EL,$rx,$tx" >> "$CSV"
+  [[ -n "$RUN_AS" ]] && chown "$RUN_AS" "$CSV" 2>/dev/null
+fi
+cleanup; trap - EXIT
+
+awk -v rx="$rx" -v tx="$tx" -v el="$TOTAL_EL" -v pk="$peak" -v pa="$peak_at" -v iv="$INTERVAL" \
+    -v intr="${INTERRUPTED:-0}" '
+function hum(b) { s="B KiB MiB GiB TiB"; n=split(s,u," "); for(i=1;i<n&&b>=1024;i++) b/=1024; return sprintf("%.2f %s", b, u[i]) }
+function hms(t) { return sprintf("%dh%02dm%05.2fs", t/3600, (t%3600)/60, t%60) }
+BEGIN{
+  printf "\n     real  %s%s\n", hms(el), (intr ? "  (interrupted)" : "")
+  printf "       rx  %s\n       tx  %s\n    total  %s\n", hum(rx), hum(tx), hum(rx+tx)
+  printf "     mean  %.2f Mbps\n", (el>0 ? (rx+tx)*8/el/1e6 : 0)
+  printf "  peak@%gs  %.2f Mbps  (at +%s)\n\n", iv, pk, hms(pa)
+}' >&2
+exit "$STATUS"
